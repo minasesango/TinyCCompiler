@@ -1,0 +1,587 @@
+#include <stdio.h>
+#include "tree.h"
+#include "tcc.tab.h"
+ 
+ 
+void emit_external_declaration(tree);
+void emit_declaration(tree);
+void emit_fundef(tree);
+void emit_statement_list(tree);
+ 
+ 
+int last_alloc = 0;
+int top_alloc = 0;
+extern token symtab;
+ 
+int allocate_loc(){
+ last_alloc -= 4;
+ if(last_alloc < top_alloc)
+  top_alloc = last_alloc;
+ return last_alloc;
+}
+ 
+void release_alloc()
+{
+ last_alloc += 4;
+}
+ 
+ 
+int count_offset(token t)
+{
+ int offset = -4;
+ if(t == NULL)return 0;
+ t = t->next;
+ while(t != NULL && t->lev > 0)
+ {
+  if(t->kind == VAR)offset -= 4;
+  t = t->next;
+ }
+ return offset;
+}
+ 
+int count_param_offset(token t)
+{
+ int offset = 8;
+ if(t == NULL)return 0;
+ t = t->next;
+ while(t != NULL && t->lev == 1)
+ {
+  if(t->kind == PARM)offset += 4;
+  t = t->next;
+ }
+ return offset;
+}
+ 
+struct code { 
+    char *cd; 
+    int is_label;
+    struct code *next;  
+};
+ 
+struct code *code_top = NULL;
+struct code *code_tail = NULL;
+int label_index = 0;
+ 
+struct code *code_add(struct code* c)
+{
+ if(code_top == NULL)
+ {
+  code_top = code_tail = c;
+  return c;
+ }
+ 
+ code_tail->next = c;
+ code_tail = c;
+ return code_top;
+}
+ 
+void print_code()
+{
+ struct code *c = code_top;
+ while(c != NULL)
+ {
+  printf("%s",c->cd);
+  c = c->next;
+ }
+}
+ 
+char *getlabel()
+{
+ char buf[80];
+ sprintf(buf,"L%d",label_index++);
+ return strdup(buf);
+}
+ 
+struct code *emit_label(const char *lname)
+{
+ char buf[80];
+ struct code *c = (struct code *)malloc(sizeof(struct code));
+ sprintf(buf,"%s:\n",lname);
+ 
+ c->cd = strdup(buf);
+ c->next = NULL;
+ c->is_label = 1;
+ code_top = code_add(c);
+ return c;
+}
+ 
+struct code *emit(const char *inst,const char *op1,const char *op2) 
+{ 
+    char buf[80]; 
+    struct code *c = (struct code *)malloc(sizeof(struct code)); 
+ 
+ 
+    if (inst == NULL)  
+      buf[0] = '\0';
+    else if (op1 == NULL)  
+        sprintf(buf, "\t%s\n", inst);  
+    else if (op2 == NULL)  
+        sprintf(buf, "\t%s\t%s\n", inst, op1); 
+    else  
+        sprintf(buf, "\t%s\t%s, %s\n", inst, op1, op2); 
+    c->cd = strdup(buf); 
+    c->next = NULL;
+    c->is_label = 0;
+    code_top = code_add(c);
+    return c;
+}
+ 
+ 
+void emit_programs(tree p)
+{
+ if(p->n.op != CONS){ /*program = external_declaration */
+  emit_external_declaration(p);
+ }
+ else{ /*program : program external-declaration*/
+  emit_programs(p->tp.a[0]);
+  emit_external_declaration(p->tp.a[1]);
+ }
+}
+ 
+void emit_program(tree p)
+{
+ /*外部参照宣言*/
+ token tk = symtab;
+ while(tk != NULL)
+ {
+  if(tk->kind == UNDEFFUN)
+   emit("EXTERN",tk->name,NULL);
+  tk = tk->next;
+  }
+ emit_programs(p);
+}
+ 
+void emit_external_declaration(tree p)
+{
+ if(p->n.op == FUNDEF) /* function definition*/
+ {
+  emit_fundef(p);
+ }
+ else if(p->n.op == TKN_INT) /* global variable */
+ {
+  emit_declaration(p);
+ }
+ else printf("error");
+}
+ 
+ 
+void emit_declarator_list(tree p)
+{
+ if(p->n.op == CONS)
+ {
+  emit_declarator_list(p->tp.a[0]);
+  emit_declarator_list(p->tp.a[1]);
+ }
+ else if(p->n.op == TKN_IDENTIFIER)
+ {
+  char buf[80];
+  sprintf(buf,"%s 4",p->tk.name);
+  emit("COMMON",buf,NULL);
+ }
+}
+ 
+void emit_declaration(tree p)
+{
+ tree declarator_list = p->tp.a[0];
+ emit_declarator_list(declarator_list);
+}
+ 
+void emit_parameter_type_list(tree p)
+{
+ if(p == NULL)return;
+ 
+ if(p->n.op == CONS)
+ {
+  emit_parameter_type_list(p->tp.a[0]);
+  emit_parameter_type_list(p->tp.a[1]);
+ }
+ else if(p->n.op == TKN_INT)
+ {
+  /*引数のオフセットを計算*/
+  (p->tp.a[0])->tk.offset = count_param_offset(&(p->tp.a[0])->tk);
+ }
+}
+ 
+void emit_let_list(tree p)
+{
+ if(p->n.op == CONS)
+ {
+  emit_let_list(p->tp.a[0]);
+  emit_let_list(p->tp.a[1]);
+ }
+ else if(p->n.op == TKN_IDENTIFIER)
+ {
+  /* 一時変数のオフセットを計算 */
+  p->tk.offset = allocate_loc();
+ }
+}
+ 
+ 
+ 
+void emit_declaration_list(tree p)
+{
+ if(p == NULL)return;
+ if(p->n.op == CONS)
+ {
+  emit_declaration_list(p->tp.a[0]);
+  emit_declaration_list(p->tp.a[1]);
+ }
+ else if(p->n.op == TKN_INT)
+ {
+  emit_let_list(p->tp.a[0]);
+ }
+}
+ 
+void emit_expression(tree);
+void emit_expr(tree);
+ 
+void release_allocs(tree p)
+{
+ if(p == NULL)return;
+ if(p->n.op == CONS)
+ {
+  release_allocs(p->tp.a[0]);
+  release_allocs(p->tp.a[1]);
+ }
+ else if(p->n.op == TKN_INT)
+ {
+  release_allocs(p->tp.a[0]);
+ }
+ else if(p->n.op == TKN_IDENTIFIER)
+ {
+  release_alloc();
+ }
+}
+ 
+void emit_compound_statement(tree p)
+{
+ emit_declaration_list(p->tp.a[0]);
+ emit_statement_list(p->tp.a[1]);
+ release_allocs(p->tp.a[0]);
+}
+ 
+int emit_argument_expression(tree p)
+{
+ int args;
+ if(p == NULL)return 0;
+ 
+ if(p->n.op == CONS)
+ {
+  return emit_argument_expression(p->tp.a[1])
+           + emit_argument_expression(p->tp.a[0]);
+ }
+ else
+ {
+  emit_expr(p);
+  emit("push","eax",NULL);
+  return 4;
+ }
+}
+ 
+ 
+void print_FCALL(tree p)
+{
+ char buf[80];
+ 
+ sprintf(buf,"%d",emit_argument_expression(p->tp.a[1]));
+ emit("call",(p->tp.a[0])->tk.name,NULL);
+ emit("add","esp",buf);
+}
+ 
+void getvarname(char *buf,token tk,int show_size)
+{
+ if(tk->lev == 0)
+ {
+  sprintf(buf,"%s[%s]",show_size?"dword ":"",tk->name);
+ }
+ else sprintf(buf,"%s[ebp%+d]",show_size?"dword ":"",tk->offset);
+}
+ 
+void emit_expr(tree p)
+{
+ char buf[80];
+ 
+ if(p->n.op == FCALL)
+ {
+  print_FCALL(p);
+  return;
+ }
+ else if(p->n.op == TKN_IDENTIFIER) /*変数*/
+ {
+  getvarname(buf,&(p->tk),0);
+  emit("mov","eax",buf);
+  return;
+ }
+ else if(p->n.op == CONST) /*定数*/
+ {
+  sprintf(buf,"%d",p->c.v);
+  emit("mov","eax",buf);
+ }
+ 
+ tree right_op = p->tp.a[1];
+ tree left_op = p->tp.a[0];
+ 
+ switch(p->n.op)
+ {
+  case '=':
+   emit_expression(right_op);
+   getvarname(buf,&left_op->tk,0);
+   emit("mov",buf,"eax");
+  break;
+ 
+  case '+':
+  {
+   sprintf(buf,"[ebp%+d]",allocate_loc());
+ 
+   emit_expression(right_op);
+   emit("mov",buf,"eax");
+   emit_expression(left_op);
+   emit("add","eax",buf);
+ 
+   release_alloc();
+  }
+  break;
+ 
+  case '-':
+  {
+   if(right_op == NULL)
+   {
+    emit_expression(left_op);
+    emit("neg","eax",NULL);
+    break;
+   }
+   sprintf(buf,"[ebp%+d]",allocate_loc());
+ 
+   emit_expression(right_op);
+   emit("mov",buf,"eax");
+   emit_expression(left_op);
+   emit("sub","eax",buf);
+ 
+   release_alloc();
+  }
+  break;
+ 
+  case '*':
+   sprintf(buf,"dword [ebp%+d]",allocate_loc());
+ 
+   emit_expression(right_op);
+   emit("mov",buf,"eax");
+   emit_expression(left_op);
+   emit("push","edx",NULL);
+   emit("imul",buf,NULL);
+   emit("pop","edx",NULL);
+   release_alloc();
+  break;
+ 
+  case '/':
+   sprintf(buf,"dword [ebp%+d]",allocate_loc());
+ 
+   emit_expression(right_op);
+   emit("mov",buf,"eax");
+   emit_expression(left_op);
+   emit("push","edx",NULL);
+   emit("cdq",NULL,NULL);
+   emit("idiv",buf,NULL);
+   emit("pop","edx",NULL);
+   release_alloc();
+  break;
+ 
+  case TKN_AND:
+  case TKN_OR:
+  {
+   char *lname = getlabel();
+   sprintf(buf,"dword [ebp%+d]",allocate_loc());
+ 
+   if(p->n.op == TKN_OR)emit("mov",buf,"1");
+   else emit("mov",buf,"0");
+ 
+   emit_expression(left_op);
+   emit("test","eax","eax");
+   if(p->n.op == TKN_OR)emit("jnz",lname,NULL);
+   else emit("jz",lname,NULL);
+ 
+   emit_expression(right_op);
+   emit("test","eax","eax");
+   if(p->n.op == TKN_OR)emit("jnz",lname,NULL);
+   else emit("jz",lname,NULL);
+ 
+   if(p->n.op == TKN_OR)emit("mov",buf,"0");
+   else emit("mov",buf,"1");
+   emit_label(lname);
+   emit("mov","eax",buf);
+ 
+   release_alloc();
+   free(lname);
+  }
+  break;
+ 
+  case TKN_EQ:
+  case TKN_NEQ:
+  case TKN_GE:
+  case TKN_LE:
+  case '>':
+  case '<':
+  {
+   const char *op;
+   if(p->n.op == TKN_EQ)op = "sete";
+   else if(p->n.op == TKN_NEQ)op = "setne";
+   else if(p->n.op == TKN_GE)op = "setge";
+   else if(p->n.op == TKN_LE)op = "setle";
+   else if(p->n.op == '<')op = "setl";
+   else if(p->n.op == '>')op = "setg";
+ 
+   sprintf(buf,"[ebp%+d]",allocate_loc());
+ 
+   emit_expression(right_op);
+   emit("mov",buf,"eax");
+   emit_expression(left_op);
+   emit("cmp","eax",buf);
+   emit(op,"al",NULL);
+   emit("movzx","eax","al");
+ 
+   release_alloc();
+  }
+  break;
+ }
+}
+ 
+void emit_expression_list(tree p)
+{
+ if(p->n.op == ',')
+ {
+  emit_expression_list(p->tp.a[0]);
+  emit_expr(p->tp.a[1]);
+ }
+ else emit_expr(p->tp.a[0]);
+}
+ 
+void emit_expression(tree p)
+{
+ if(p->n.op == ',')
+ {
+   emit_expression_list(p);
+ }
+ else
+ {
+  emit_expr(p);
+ }
+}
+ 
+char *f_ret;
+ 
+void emit_statement(tree p)
+{
+ char buf[80];
+ 
+ if(p==NULL)return;
+ 
+ if(p->n.op == CMPDSTM)emit_compound_statement(p);
+ else if(p->n.op == T_IF)
+ {
+  char *L1 = getlabel();
+  char *L2;
+ 
+  if(p->tp.a[2] != NULL)L2 = getlabel();
+  emit_expression(p->tp.a[0]);
+  emit("test","eax","eax");
+  emit("jz",L1,NULL);
+  emit_statement(p->tp.a[1]);
+  if(p->tp.a[2] != NULL)emit("jmp",L2,NULL);
+  emit_label(L1);
+ 
+  if(p->tp.a[2] != NULL)
+  {
+   emit_statement(p->tp.a[2]);
+   emit_label(L2);
+   free(L2);
+  }
+ 
+  free(L1);
+ }
+ else if(p->n.op == T_WHILE)
+ {
+  char *L1 = getlabel();
+  char *L2 = getlabel();
+  char *L3 = getlabel();
+ 
+  emit("jmp",L2,NULL);
+  emit_label(L1);
+  emit_statement(p->tp.a[1]);
+  emit_label(L2);
+  emit_statement(p->tp.a[0]);
+ 
+  emit("test","eax","eax");
+  emit("jnz",L1,NULL);
+ 
+  emit_label(L3);
+ 
+  free(L1);
+  free(L2);
+  free(L3);
+ }
+ else if(p->n.op == T_RETURN)
+ {
+  if(p->tp.a[0] != NULL)
+  {
+   emit_expression(p->tp.a[0]);
+  }
+  emit("jmp",f_ret,NULL);
+ }
+ else
+ {
+  emit_expression(p);
+  printf("\n");
+ }
+}
+ 
+void emit_statement_list(tree p)
+{
+ if(p == NULL)return;
+ 
+ if(p->n.op == CONS)
+ {
+  emit_statement_list(p->tp.a[0]);
+  emit_statement(p->tp.a[1]);
+ }
+ else
+ {
+  emit_statement(p);
+ }
+}
+ 
+void emit_fundef(tree p)
+{
+ char buf[80];
+ 
+ top_alloc = 0;
+ 
+ /*関数定義*/
+ emit("GLOBAL", ((p->tp.a[0])->tp.a[0])->tk.name ,NULL);
+ sprintf(buf,"%s",((p->tp.a[0])->tp.a[0])->tk.name);
+ emit_label(buf);
+ emit("push","ebp",NULL);
+ emit("mov","ebp","esp");
+ /*仮のコード*/
+ struct code *c = emit(NULL,NULL,NULL);
+ 
+ /*関数の戻り先*/
+ sprintf(buf,"%sret",((p->tp.a[0])->tp.a[0])->tk.name);
+ f_ret = buf;
+ 
+ emit_parameter_type_list(p->tp.a[1]); /*offsetの計算のみ*/
+ emit_compound_statement(p->tp.a[2]);
+ 
+ /*後処理*/
+ emit_label(buf);
+ emit("mov","esp","ebp");
+ emit("pop","ebp",NULL);
+ emit("ret",NULL,NULL);
+ 
+ /*仮のコード生成*/
+ if(top_alloc)
+ {
+  sprintf(buf,"\tsub\tesp, %d\n",-top_alloc);
+  c->cd = strdup(buf);
+ }
+}
+ 
